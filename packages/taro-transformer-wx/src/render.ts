@@ -23,7 +23,8 @@ import {
   isContainJSXElement,
   getSlotName,
   getSuperClassCode,
-  isContainStopPropagation
+  isContainStopPropagation,
+  noop
 } from './utils'
 import { difference, get as safeGet, cloneDeep } from 'lodash'
 import {
@@ -112,6 +113,7 @@ export class RenderParser {
   private usedThisProperties = new Set<string>()
   private incrementCalleeId = incrementId()
   private classComputedState = new Set<string>()
+  private loopCallees = new Set<t.Node>()
   private loopIfStemComponentMap = new Map<NodePath<t.CallExpression>, t.JSXElement>()
   private hasNoReturnLoopStem = false
 
@@ -445,6 +447,7 @@ export class RenderParser {
                 ) {
                   let ary = callee.object
                   if (t.isCallExpression(ary) || isContainFunction(callExpr.get('callee').get('object'))) {
+                    this.loopCallees.add(ary)
                     const variableName = `${LOOP_CALLEE}_${this.incrementCalleeId()}`
                     callExpr.getStatementParent().insertBefore(
                       buildConstVariableDeclaration(variableName, setParentCondition(jsxElementPath, ary, true))
@@ -531,10 +534,10 @@ export class RenderParser {
 
   private renameIfScopeVaribale = (blockStatement: NodePath<t.BlockStatement>): Visitor => {
     return {
-      VariableDeclarator: (p) => {
-        const { id, init } = p.node
-        const ifStem = p.parentPath.parentPath.parentPath
-        if (!ifStem.isIfStatement() || isContainJSXElement(p)) {
+      VariableDeclarator: (path) => {
+        const { id, init } = path.node
+        const ifStem = path.parentPath.parentPath.parentPath
+        if (!ifStem.isIfStatement() || isContainJSXElement(path)) {
           return
         }
         if (t.isIdentifier(id)) {
@@ -542,13 +545,13 @@ export class RenderParser {
             this.renderPath.node.body.body.unshift(
               t.variableDeclaration('let', [t.variableDeclarator(t.identifier(id.name))])
             )
-            p.parentPath.replaceWith(
+            path.parentPath.replaceWith(
               template('ID = INIT;')({ ID: t.identifier(id.name), INIT: init })
             )
           } else {
             const newId = this.renderScope.generateDeclaredUidIdentifier('$' + id.name)
             blockStatement.scope.rename(id.name, newId.name)
-            p.parentPath.replaceWith(
+            path.parentPath.replaceWith(
               template('ID = INIT;')({ ID: newId, INIT: init || t.identifier('undefined') })
             )
           }
@@ -559,7 +562,7 @@ export class RenderParser {
           this.handleConditionExpr(options, jsxElementPath)
         })
       },
-      JSXExpressionContainer: this.replaceIdWithTemplate()
+      JSXExpressionContainer: this.replaceIdWithTemplate(true)
     }
   }
 
@@ -1360,13 +1363,24 @@ export class RenderParser {
         }
         const callGetElementById = t.callExpression(t.identifier(GEL_ELEMENT_BY_ID), args)
         const refDecl = buildConstVariableDeclaration(refDeclName,
-          process.env.NODE_ENV === 'test' ? callGetElementById : t.logicalExpression('&&', t.identifier('__scope'), t.logicalExpression('&&', t.identifier('__runloopRef'), callGetElementById))
+          process.env.NODE_ENV === 'test' ? callGetElementById : t.logicalExpression('&&', t.identifier('__scope'), t.logicalExpression('&&', t.identifier('__isRunloopRef'), callGetElementById))
         )
         const callRef = t.callExpression(ref.fn, [t.identifier(refDeclName)])
         const callRefFunc = t.expressionStatement(
           process.env.NODE_ENV === 'test' ? callRef : t.logicalExpression('&&', t.identifier(refDeclName), callRef)
         )
-        body.push(refDecl, callRefFunc)
+        if (Adapter.type === Adapters.tt) {
+          body.push(
+            t.expressionStatement(
+              t.callExpression(
+                t.memberExpression(t.identifier('Taro'), t.identifier('handleLoopRef')),
+                args.length === 2 ? [...args, t.nullLiteral(), ref.fn] : [...args, ref.fn]
+              )
+            )
+          )
+        } else {
+          body.push(refDecl, callRefFunc)
+        }
       }
       let stateToBeAssign = new Set<string>(
         difference(
@@ -1384,7 +1398,7 @@ export class RenderParser {
       if (body.length > 1) {
         const [ func ] = callee.node.arguments
         if (t.isFunctionExpression(func) || t.isArrowFunctionExpression(func)) {
-          const [ item ] = func.params as t.Identifier[]
+          const [ item, indexParam ] = func.params as t.Identifier[]
           const parents = findParents(callee, (p) => isArrayMapCallExpression(p))
           const iterators = new Set<string>(
             [item.name, ...parents
@@ -1436,6 +1450,15 @@ export class RenderParser {
           })
           const replacements = new Set()
           component.traverse({
+            JSXAttribute: !t.isIdentifier(indexParam) ? noop : (path: NodePath<t.JSXAttribute>) => {
+              const { value } = path.node
+              if (t.isJSXExpressionContainer(value) && t.isJSXIdentifier(path.node.name, { name: 'key' }) && t.isIdentifier(value.expression, { name: indexParam.name })) {
+                if (process.env.TERM_PROGRAM || process.env.NODE_ENV === 'test') { // 无法找到 cli 名称的工具（例如 idea/webstorm）显示这个报错可能会乱码
+                  // tslint:disable-next-line:no-console
+                  console.log(codeFrameError(value.expression, '建议修改：使用循环的 index 变量作为 key 是一种反优化。参考：https://github.com/yannickcr/eslint-plugin-react/blob/master/docs/rules/no-array-index-key.md').message)
+                }
+              }
+            },
             JSXExpressionContainer: this.replaceIdWithTemplate(),
             Identifier: (path) => {
               const name = path.node.name
@@ -1454,6 +1477,9 @@ export class RenderParser {
                   if (grandParentPath.isCallExpression() && this.loopComponents.has(grandParentPath)) {
                     return
                   }
+                }
+                if (path.findParent(p => this.loopCallees.has(p.node))) {
+                  return
                 }
                 const replacement = t.memberExpression(
                   t.identifier(item.name),
@@ -1809,7 +1835,7 @@ export class RenderParser {
     this.renderPath.node.body.body.unshift(
       template(`this.__state = arguments[0] || this.state || {};`)(),
       template(`this.__props = arguments[1] || this.props || {};`)(),
-      template(`const __runloopRef = arguments[2];`)(),
+      template(`const __isRunloopRef = arguments[2];`)(),
       this.usedThisProperties.size
         ? t.variableDeclaration(
           'const',
